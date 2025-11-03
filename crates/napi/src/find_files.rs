@@ -42,9 +42,32 @@ pub struct IterateFiles<D> {
   producer: fn(&D, Entry, &LangOption) -> Ret<bool>,
 }
 
-impl<T: 'static + Send + Sync> Task for IterateFiles<T> {
-  type Output = u32;
-  type JsValue = u32;
+trait EmitDone {
+  fn emit_done(&self, count: u32);
+}
+
+impl EmitDone for ThreadsafeFunction<Either<SgRoot, u32>, ()> {
+  fn emit_done(&self, count: u32) {
+    self.call(Ok(Either::B(count)), ThreadsafeFunctionCallMode::Blocking);
+  }
+}
+
+impl EmitDone
+  for (
+    ThreadsafeFunction<Either<PinnedNodes, u32>, (), Either<Vec<SgNode>, u32>>,
+    RuleCore,
+  )
+{
+  fn emit_done(&self, count: u32) {
+    self
+      .0
+      .call(Ok(Either::B(count)), ThreadsafeFunctionCallMode::Blocking);
+  }
+}
+
+impl<T: 'static + Send + Sync + EmitDone> Task for IterateFiles<T> {
+  type Output = ();
+  type JsValue = ();
 
   fn compute(&mut self) -> Result<Self::Output> {
     let tsfn = &self.tsfn;
@@ -65,10 +88,12 @@ impl<T: 'static + Send + Sync> Task for IterateFiles<T> {
         Err(_) => WalkState::Skip,
       })
     });
-    Ok(file_count.load(Ordering::Acquire))
+    let count = file_count.load(Ordering::Acquire);
+    self.tsfn.emit_done(count);
+    Ok(())
   }
-  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    Ok(output)
+  fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+    Ok(())
   }
 }
 
@@ -76,8 +101,12 @@ impl<T: 'static + Send + Sync> Task for IterateFiles<T> {
 // NodeJS has a 1000 file limitation on sync iteration count.
 // https://github.com/nodejs/node/blob/8ba54e50496a6a5c21d93133df60a9f7cb6c46ce/src/node_api.cc#L336
 // const THREAD_FUNC_QUEUE_SIZE: usize = 1000;
+// We alleviate this by creating a Promise on the JS side, and once the iteration is complete, we send
+// the count via the same callback. JS checks each callback call for this number value, and resolves
+// the promise with the count once it's done. Since the queue on the JS end is iterated in order, this
+// guarantees the promise resolves after all callbacks have been received.
 
-type ParseFiles = IterateFiles<ThreadsafeFunction<SgRoot, ()>>;
+type ParseFiles = IterateFiles<ThreadsafeFunction<Either<SgRoot, u32>, ()>>;
 
 #[napi(object)]
 pub struct FileOption {
@@ -88,7 +117,7 @@ pub struct FileOption {
 #[napi]
 pub fn parse_files(
   paths: Either<Vec<String>, FileOption>,
-  callback: Function<SgRoot, ()>,
+  callback: Function<Either<SgRoot, u32>, ()>,
 ) -> Result<AsyncTask<ParseFiles>> {
   let tsfn = callback
     .build_threadsafe_function()
@@ -112,7 +141,7 @@ pub fn parse_files(
 
 // returns if the entry is a file and sent to JavaScript queue
 fn call_sg_root(
-  tsfn: &ThreadsafeFunction<SgRoot, ()>,
+  tsfn: &ThreadsafeFunction<Either<SgRoot, u32>, ()>,
   entry: std::result::Result<ignore::DirEntry, ignore::Error>,
   lang_option: &LangOption,
 ) -> Ret<bool> {
@@ -126,7 +155,7 @@ fn call_sg_root(
   }
   let (root, path) = get_root(entry, lang_option)?;
   let sg = SgRoot(root, path);
-  tsfn.call(Ok(sg), ThreadsafeFunctionCallMode::Blocking);
+  tsfn.call(Ok(Either::A(sg)), ThreadsafeFunctionCallMode::Blocking);
   Ok(true)
 }
 
@@ -140,7 +169,10 @@ fn get_root(entry: ignore::DirEntry, lang_option: &LangOption) -> Ret<(AstGrep<J
   Ok((AstGrep::doc(doc), path.to_string_lossy().into()))
 }
 
-pub type FindInFiles = IterateFiles<(ThreadsafeFunction<PinnedNodes, (), Vec<SgNode>>, RuleCore)>;
+pub type FindInFiles = IterateFiles<(
+  ThreadsafeFunction<Either<PinnedNodes, u32>, (), Either<Vec<SgNode>, u32>>,
+  RuleCore,
+)>;
 
 pub struct PinnedNodes(
   PinnedNodeData<JsDoc, Vec<NodeMatch<'static, JsDoc>>>,
@@ -164,12 +196,15 @@ pub struct FindConfig {
 pub fn find_in_files_impl(
   lang: NapiLang,
   config: FindConfig,
-  callback: Function<Vec<SgNode>, ()>,
+  callback: Function<Either<Vec<SgNode>, u32>, ()>,
 ) -> Result<AsyncTask<FindInFiles>> {
   let tsfn = callback
     .build_threadsafe_function()
     .callee_handled()
-    .build_callback(|ctx| from_pinned_data(ctx.value, ctx.env))?;
+    .build_callback(|ctx| match ctx.value {
+      Either::A(pinned) => Ok(Either::A(from_pinned_data(pinned, ctx.env)?)),
+      Either::B(count) => Ok(Either::B(count)),
+    })?;
   let FindConfig {
     paths,
     matcher,
@@ -206,7 +241,10 @@ fn from_pinned_data(pinned: PinnedNodes, env: napi::Env) -> Result<Vec<SgNode>> 
 }
 
 fn call_sg_node(
-  (tsfn, rule): &(ThreadsafeFunction<PinnedNodes, (), Vec<SgNode>>, RuleCore),
+  (tsfn, rule): &(
+    ThreadsafeFunction<Either<PinnedNodes, u32>, (), Either<Vec<SgNode>, u32>>,
+    RuleCore,
+  ),
   entry: std::result::Result<ignore::DirEntry, ignore::Error>,
   lang_option: &LangOption,
 ) -> Ret<bool> {
@@ -225,6 +263,6 @@ fn call_sg_node(
     return Ok(false);
   }
   let pinned = PinnedNodes(pinned, path);
-  tsfn.call(Ok(pinned), ThreadsafeFunctionCallMode::Blocking);
+  tsfn.call(Ok(Either::A(pinned)), ThreadsafeFunctionCallMode::Blocking);
   Ok(true)
 }
